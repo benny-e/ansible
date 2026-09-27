@@ -1,0 +1,19 @@
+# Secrets / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+
+# Ansible secrets
+.vault_pass
+vault_password*
+
+# Ansible artifacts
+*.retry
+
+# Editor files
+*.swp
+*.swo
+*~

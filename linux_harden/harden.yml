@@ -1,0 +1,270 @@
+---
+- name: Harden new Debian or Ubuntu server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars_prompt:
+    - name: admin_user
+      prompt: "Admin username"
+      default: admin
+      private: false
+
+  vars:
+    admin_shell: /bin/bash
+
+    # Keys on the Ansible control machine
+    admin_public_key_file: "{{ lookup('env', 'HOME') + '/.ssh/id_ed25519.pub' }}"
+    admin_private_key_file: "{{ lookup('env', 'HOME') + '/.ssh/id_ed25519' }}"
+
+    ssh_port: 22
+
+    baseline_packages:
+      - sudo
+      - vim
+      - git
+      - curl
+      - wget
+      - htop
+      - tmux
+      - jq
+      - rsync
+      - unzip
+      - ca-certificates
+      - ufw
+      - fail2ban
+      - unattended-upgrades
+      - needrestart
+      - fastfetch
+
+  pre_tasks:
+    - name: Refuse to run on non-Debian systems
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["os_family"] == "Debian"
+        fail_msg: "This playbook currently supports Debian/Ubuntu systems only."
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Updates / packages
+    # -------------------------------------------------------------------------
+
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Upgrade installed packages
+      ansible.builtin.apt:
+        upgrade: safe
+
+    - name: Install baseline packages
+      ansible.builtin.apt:
+        name: "{{ baseline_packages }}"
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Admin account
+    # -------------------------------------------------------------------------
+
+    - name: Create admin user
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - sudo
+        append: true
+        state: present
+
+    - name: Create admin SSH directory
+      ansible.builtin.file:
+        path: "/home/{{ admin_user }}/.ssh"
+        state: directory
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: "0700"
+
+    - name: Install admin SSH public key
+      ansible.builtin.lineinfile:
+        path: "/home/{{ admin_user }}/.ssh/authorized_keys"
+        line: "{{ lookup('file', admin_public_key_file) }}"
+        create: true
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: "0600"
+        state: present
+
+    - name: Configure passwordless sudo for admin
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ admin_user }}"
+        content: "{{ admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "/usr/sbin/visudo -cf %s"
+
+    # IMPORTANT:
+    # Do not disable old SSH access until we've proven the new key works.
+
+    - name: Verify admin SSH key works
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - ConnectTimeout=10
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -p
+          - "{{ ssh_port | string }}"
+          - -i
+          - "{{ admin_private_key_file }}"
+          - "{{ admin_user }}@{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+          - "true"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # UFW
+    # -------------------------------------------------------------------------
+
+    - name: Set UFW default incoming policy
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: Set UFW default outgoing policy
+      community.general.ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: Allow SSH through UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+        comment: SSH
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+        logging: low
+
+    # -------------------------------------------------------------------------
+    # Fail2ban
+    # -------------------------------------------------------------------------
+
+    - name: Configure Fail2ban SSH protection
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/sshd.local
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          maxretry = 5
+          findtime = 10m
+          bantime = 1h
+      notify: Restart Fail2ban
+
+    - name: Enable and start Fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    # -------------------------------------------------------------------------
+    # Automatic security updates
+    # -------------------------------------------------------------------------
+
+    - name: Enable automatic package list updates and unattended upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    # -------------------------------------------------------------------------
+    # SSH hardening
+    # -------------------------------------------------------------------------
+
+    - name: Ensure SSH configuration directory exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install SSH hardening configuration
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible
+
+          Port {{ ssh_port }}
+
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          PermitEmptyPasswords no
+
+          X11Forwarding no
+
+          MaxAuthTries 3
+          LoginGraceTime 30
+      register: ssh_hardening
+
+    - name: Validate SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -t
+      changed_when: false
+      when: ssh_hardening.changed
+
+    - name: Reload SSH with hardened configuration
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: reloaded
+      when: ssh_hardening.changed
+
+    # -------------------------------------------------------------------------
+    # Final verification
+    # -------------------------------------------------------------------------
+
+    - name: Verify hardened SSH login works
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - ConnectTimeout=10
+          - -p
+          - "{{ ssh_port | string }}"
+          - -i
+          - "{{ admin_private_key_file }}"
+          - "{{ admin_user }}@{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+          - "true"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+  handlers:
+    - name: Restart Fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: restarted
