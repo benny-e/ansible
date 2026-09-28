@@ -1,1 +1,1 @@
-Ansible repo for automating machine deployment
+Ansible repo for automating machine deployment/maintenance
