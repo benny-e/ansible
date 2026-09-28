@@ -17,3 +17,5 @@ vault_password*
 *.swp
 *.swo
 *~
+
+inventory.ini

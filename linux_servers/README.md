@@ -1,13 +1,31 @@
-Ansible playbook for quickly configuring a hardened linux debian server.
+# Ansible
 
-Includes SSH key setup/hardening, UFW, fail2ban, common tools, and unattended upgrades.
+## Harden New Server
 
-Usage:
-```
-ansible-playbook -i 'SERVER_IP,' -u USER -k -K harden.yml
+```bash
+ansible-playbook -i 'SERVER_IP,' -u USER -k -K linux_servers/harden.yml
 ```
 
-Setting custom admin user:
+Custom admin user:
+
+```bash
+ansible-playbook -i 'SERVER_IP,' -u USER -k -K -e admin_user=myuser linux_servers/harden.yml
 ```
-ansible-playbook -i 'SERVER_IP,' -u USER -k -K -e admin_user=myuser harden.yml
+
+## Audit Server
+
+```bash
+ansible-playbook -i inventory.ini linux_servers/maintenance.yml --limit HOST -K
+```
+
+## Audit + Update Server
+
+```bash
+ansible-playbook -i inventory.ini linux_servers/maintenance.yml --limit HOST -K -e apply_updates=true
+```
+
+## Test Connectivity
+
+```bash
+ansible all -i inventory.ini -m ping
 ```

@@ -1,0 +1,316 @@
+---
+- name: Audit and maintain Debian servers
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    apply_updates: false
+    disk_warning_percent: 80
+
+  pre_tasks:
+    - name: Refuse to run on non-Debian systems
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["os_family"] == "Debian"
+        fail_msg: "This playbook currently supports Debian/Ubuntu systems only."
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # System information
+    # -------------------------------------------------------------------------
+
+    - name: Gather service information
+      ansible.builtin.service_facts:
+
+    - name: Check memory usage
+      ansible.builtin.shell: |
+        free -h | awk '/^Mem:/ {print $3 " used / " $2 " total"}'
+      register: memory_usage
+      changed_when: false
+
+    - name: Check load average
+      ansible.builtin.command:
+        argv:
+          - cat
+          - /proc/loadavg
+      register: load_average
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Package updates
+    # -------------------------------------------------------------------------
+
+    - name: Refresh APT package metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Check available updates
+      ansible.builtin.shell: |
+        apt-get -s upgrade | grep '^Inst ' || true
+      register: updates_before
+      changed_when: false
+
+    - name: Apply available updates
+      ansible.builtin.apt:
+        upgrade: safe
+      when: apply_updates | bool
+
+    - name: Check remaining updates
+      ansible.builtin.shell: |
+        apt-get -s upgrade | grep '^Inst ' || true
+      register: updates_after
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Reboot / needrestart
+    # -------------------------------------------------------------------------
+
+    - name: Check whether reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Check whether needrestart is installed
+      ansible.builtin.shell: command -v needrestart
+      register: needrestart_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check for processes requiring restart
+      ansible.builtin.command:
+        argv:
+          - needrestart
+          - -b
+          - -r
+          - l
+      register: needrestart_status
+      changed_when: false
+      failed_when: false
+      when: needrestart_installed.rc == 0
+
+    # -------------------------------------------------------------------------
+    # Failed services
+    # -------------------------------------------------------------------------
+
+    - name: Check failed systemd services
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --failed
+          - --type=service
+          - --no-legend
+          - --plain
+      register: failed_services
+      changed_when: false
+      failed_when: false
+
+    # -------------------------------------------------------------------------
+    # Disk
+    # -------------------------------------------------------------------------
+
+    - name: Check root filesystem usage
+      ansible.builtin.shell: |
+        df -P / | awk 'NR==2 {gsub("%","",$5); print $5}'
+      register: root_disk_usage
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # Firewall
+    # -------------------------------------------------------------------------
+
+    - name: Check UFW status
+      ansible.builtin.command:
+        argv:
+          - ufw
+          - status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    # -------------------------------------------------------------------------
+    # Fail2ban
+    # -------------------------------------------------------------------------
+
+    - name: Check Fail2ban SSH jail
+      ansible.builtin.command:
+        argv:
+          - fail2ban-client
+          - status
+          - sshd
+      register: fail2ban_sshd
+      changed_when: false
+      failed_when: false
+      when:
+        - ansible_facts["services"].get("fail2ban.service", {}).get("state", "") == "running"
+
+    # -------------------------------------------------------------------------
+    # SSH configuration
+    # -------------------------------------------------------------------------
+
+    - name: Check effective SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -T
+      register: sshd_config
+      changed_when: false
+      failed_when: false
+
+    # -------------------------------------------------------------------------
+    # Time synchronization
+    # -------------------------------------------------------------------------
+
+    - name: Check time synchronization
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - show
+          - -p
+          - NTPSynchronized
+          - --value
+      register: time_sync
+      changed_when: false
+      failed_when: false
+
+    # -------------------------------------------------------------------------
+    # Docker detection
+    # -------------------------------------------------------------------------
+
+    - name: Check whether Docker is installed
+      ansible.builtin.shell: command -v docker
+      register: docker_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check Docker daemon
+      ansible.builtin.command:
+        argv:
+          - docker
+          - info
+      register: docker_info
+      changed_when: false
+      failed_when: false
+      when: docker_installed.rc == 0
+
+    - name: Get all Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -a
+          - -q
+      register: docker_all
+      changed_when: false
+      when:
+        - docker_installed.rc == 0
+        - docker_info.rc | default(1) == 0
+
+    - name: Get running Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -q
+      register: docker_running
+      changed_when: false
+      when:
+        - docker_installed.rc == 0
+        - docker_info.rc | default(1) == 0
+
+    - name: Get unhealthy Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -q
+          - --filter
+          - health=unhealthy
+      register: docker_unhealthy
+      changed_when: false
+      when:
+        - docker_installed.rc == 0
+        - docker_info.rc | default(1) == 0
+
+    - name: Get exited Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -a
+          - -q
+          - --filter
+          - status=exited
+      register: docker_exited
+      changed_when: false
+      when:
+        - docker_installed.rc == 0
+        - docker_info.rc | default(1) == 0
+
+    - name: Get restarting Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -a
+          - -q
+          - --filter
+          - status=restarting
+      register: docker_restarting
+      changed_when: false
+      when:
+        - docker_installed.rc == 0
+        - docker_info.rc | default(1) == 0
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+
+    - name: Server maintenance summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================"
+          - "{{ inventory_hostname }}"
+          - "========================================"
+          - "OS: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+          - "Kernel: {{ ansible_facts['kernel'] }}"
+          - "Uptime: {{ (ansible_facts['uptime_seconds'] | int / 86400) | round(1) }} days"
+          - "Memory: {{ memory_usage.stdout }}"
+          - "Load: {{ load_average.stdout.split()[0:3] | join(', ') }}"
+          - "Root filesystem: {{ root_disk_usage.stdout }}%{{ '  WARNING' if root_disk_usage.stdout | int >= disk_warning_percent else '' }}"
+          - "Updates available before run: {{ updates_before.stdout_lines | length }}"
+          - "Updates applied: {{ 'YES' if apply_updates | bool else 'NO' }}"
+          - "Updates remaining: {{ updates_after.stdout_lines | length }}"
+          - "Reboot required: {{ 'YES' if reboot_required.stat.exists else 'NO' }}"
+          - "Failed services: {{ failed_services.stdout_lines | length }}"
+          - "UFW: {{ ufw_status.stdout_lines | first | default('not installed / unavailable') }}"
+          - "Fail2ban: {{ ansible_facts['services'].get('fail2ban.service', {}).get('state', 'not installed') }}"
+          - "Fail2ban SSH jail: {{ 'active' if fail2ban_sshd.rc | default(1) == 0 else 'inactive / unavailable' }}"
+          - "Time synchronized: {{ time_sync.stdout | default('unknown') }}"
+          - "SSH: {{ sshd_config.stdout_lines | select('match', '^(permitrootlogin|passwordauthentication|pubkeyauthentication|maxauthtries) ') | list | join(', ') }}"
+
+    # Only appears on hosts that actually have containers.
+
+    - name: Docker maintenance summary
+      ansible.builtin.debug:
+        msg:
+          - "Docker containers: {{ docker_all.stdout_lines | length }}"
+          - "Running: {{ docker_running.stdout_lines | length }}"
+          - "Exited: {{ docker_exited.stdout_lines | length }}"
+          - "Restarting: {{ docker_restarting.stdout_lines | length }}"
+          - "Unhealthy: {{ docker_unhealthy.stdout_lines | length }}"
+      when:
+        - docker_all.stdout_lines | default([]) | length > 0
+
+    - name: Show failed services
+      ansible.builtin.debug:
+        var: failed_services.stdout_lines
+      when: failed_services.stdout_lines | length > 0
+
+    - name: Show needrestart findings
+      ansible.builtin.debug:
+        var: needrestart_status.stdout_lines
+      when:
+        - needrestart_status is defined
+        - needrestart_status.stdout_lines | default([]) | length > 0
