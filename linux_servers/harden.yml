@@ -235,6 +235,26 @@
       changed_when: false
       when: ssh_hardening.changed
 
+    - name: Disable SSH socket activation
+      ansible.builtin.systemd_service:
+        name: ssh.socket
+        state: stopped
+        enabled: false
+
+    - name: Ensure SSH runtime directory exists
+      ansible.builtin.file:
+        path: /run/sshd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure SSH service is enabled and running
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: started
+        enabled: true
+
     - name: Reload SSH with hardened configuration
       ansible.builtin.systemd_service:
         name: ssh
