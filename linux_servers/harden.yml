@@ -44,6 +44,30 @@
           - ansible_facts["os_family"] == "Debian"
         fail_msg: "This playbook currently supports Debian/Ubuntu systems only."
 
+    - name: Verify controller public key exists
+      ansible.builtin.stat:
+        path: "{{ admin_public_key_file }}"
+      delegate_to: localhost
+      become: false
+      register: controller_public_key
+
+    - name: Verify controller private key exists
+      ansible.builtin.stat:
+        path: "{{ admin_private_key_file }}"
+      delegate_to: localhost
+      become: false
+      register: controller_private_key
+
+    - name: Refuse to continue without SSH keypair
+      ansible.builtin.assert:
+        that:
+          - controller_public_key.stat.exists
+          - controller_private_key.stat.exists
+        fail_msg: >-
+          Expected SSH keypair at
+          {{ admin_private_key_file }} and
+          {{ admin_public_key_file }}.
+
   tasks:
     # -------------------------------------------------------------------------
     # Updates / packages
@@ -70,12 +94,58 @@
     - name: Create admin user
       ansible.builtin.user:
         name: "{{ admin_user }}"
-        shell: /bin/bash
+        shell: "{{ admin_shell }}"
         create_home: true
         groups:
           - sudo
         append: true
         state: present
+
+    # A newly-created Debian account can have a locked password field ("!").
+    # sshd can reject public-key authentication for a locked account.
+    #
+    # "NP" is deliberately NOT a usable password hash. It prevents the account
+    # from being treated as locked while still providing no usable password.
+    #
+    # Later in this playbook SSH password authentication is disabled entirely.
+
+    - name: Check admin account password state
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/passwd
+          - -S
+          - "{{ admin_user }}"
+      register: admin_password_state
+      changed_when: false
+
+    - name: Make locked admin account usable for key authentication
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/usermod
+          - -p
+          - NP
+          - "{{ admin_user }}"
+      when:
+        - admin_password_state.stdout.split() | length >= 2
+        - admin_password_state.stdout.split()[1] == "L"
+
+    - name: Recheck admin account password state
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/passwd
+          - -S
+          - "{{ admin_user }}"
+      register: admin_password_state_after
+      changed_when: false
+
+    - name: Refuse to continue if admin account is still locked
+      ansible.builtin.assert:
+        that:
+          - admin_password_state_after.stdout.split() | length >= 2
+          - admin_password_state_after.stdout.split()[1] != "L"
+        fail_msg: >-
+          The {{ admin_user }} account is still locked.
+          Refusing to change SSH configuration.
 
     - name: Create admin SSH directory
       ansible.builtin.file:
@@ -95,6 +165,12 @@
         mode: "0600"
         state: present
 
+    - name: Ensure admin home ownership is correct
+      ansible.builtin.file:
+        path: "/home/{{ admin_user }}"
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+
     - name: Configure passwordless sudo for admin
       ansible.builtin.copy:
         dest: "/etc/sudoers.d/{{ admin_user }}"
@@ -104,8 +180,77 @@
         mode: "0440"
         validate: "/usr/sbin/visudo -cf %s"
 
-    # IMPORTANT:
-    # Do not disable old SSH access until we've proven the new key works.
+    # -------------------------------------------------------------------------
+    # Bootstrap SSH configuration
+    #
+    # DO NOT disable password authentication yet.
+    #
+    # We first explicitly configure sshd to accept the key from the normal
+    # authorized_keys location, reload it, and prove the new account works.
+    # -------------------------------------------------------------------------
+
+    - name: Ensure SSH configuration directory exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install temporary SSH bootstrap configuration
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible
+          # Bootstrap configuration - hardening occurs after key verification.
+
+          PubkeyAuthentication yes
+          AuthorizedKeysFile .ssh/authorized_keys
+          AuthenticationMethods any
+          PermitEmptyPasswords no
+      register: ssh_bootstrap_config
+
+    - name: Validate bootstrap SSH configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/sshd
+          - -t
+      changed_when: false
+
+    # ssh.service may be inactive when Debian/Ubuntu uses ssh.socket.
+    # If the service is already running, reload it.
+    # If socket activation is being used, new sshd processes will read the
+    # updated configuration on the next connection.
+
+    - name: Check whether SSH service is active
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - ssh.service
+      register: ssh_service_active
+      changed_when: false
+      failed_when: false
+
+    - name: Reload SSH bootstrap configuration
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: reloaded
+      when:
+        - ssh_bootstrap_config.changed
+        - ssh_service_active.rc == 0
+
+    # -------------------------------------------------------------------------
+    # CRITICAL SAFETY CHECK
+    #
+    # This test allows PUBLIC KEY AUTHENTICATION ONLY.
+    #
+    # If this fails, the playbook stops here. Password authentication and the
+    # original bootstrap account remain untouched.
+    # -------------------------------------------------------------------------
 
     - name: Verify admin SSH key works
       ansible.builtin.command:
@@ -113,6 +258,14 @@
           - ssh
           - -o
           - BatchMode=yes
+          - -o
+          - IdentitiesOnly=yes
+          - -o
+          - PreferredAuthentications=publickey
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - KbdInteractiveAuthentication=no
           - -o
           - ConnectTimeout=10
           - -o
@@ -193,18 +346,12 @@
           APT::Periodic::Unattended-Upgrade "1";
 
     # -------------------------------------------------------------------------
-    # SSH hardening
+    # Final SSH hardening
+    #
+    # We only reach this point after PUBLIC KEY AUTHENTICATION HAS SUCCEEDED.
     # -------------------------------------------------------------------------
 
-    - name: Ensure SSH configuration directory exists
-      ansible.builtin.file:
-        path: /etc/ssh/sshd_config.d
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Install SSH hardening configuration
+    - name: Install final SSH hardening configuration
       ansible.builtin.copy:
         dest: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
         owner: root
@@ -216,9 +363,13 @@
           Port {{ ssh_port }}
 
           PermitRootLogin no
+
+          PubkeyAuthentication yes
+          AuthorizedKeysFile .ssh/authorized_keys
+          AuthenticationMethods publickey
+
           PasswordAuthentication no
           KbdInteractiveAuthentication no
-          PubkeyAuthentication yes
           PermitEmptyPasswords no
 
           X11Forwarding no
@@ -227,19 +378,33 @@
           LoginGraceTime 30
       register: ssh_hardening
 
-    - name: Validate SSH configuration
+    - name: Validate final SSH configuration
       ansible.builtin.command:
         argv:
           - /usr/sbin/sshd
           - -t
       changed_when: false
-      when: ssh_hardening.changed
+
+    # Ubuntu/Debian can use ssh.socket. We deliberately switch to the normal
+    # ssh.service so sshd itself owns the listener and the Port directive is
+    # consistently controlled by sshd_config.
+
+    - name: Check whether ssh.socket exists
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - cat
+          - ssh.socket
+      register: ssh_socket_unit
+      changed_when: false
+      failed_when: false
 
     - name: Disable SSH socket activation
       ansible.builtin.systemd_service:
         name: ssh.socket
         state: stopped
         enabled: false
+      when: ssh_socket_unit.rc == 0
 
     - name: Ensure SSH runtime directory exists
       ansible.builtin.file:
@@ -272,7 +437,17 @@
           - -o
           - BatchMode=yes
           - -o
+          - IdentitiesOnly=yes
+          - -o
+          - PreferredAuthentications=publickey
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - KbdInteractiveAuthentication=no
+          - -o
           - ConnectTimeout=10
+          - -o
+          - StrictHostKeyChecking=accept-new
           - -p
           - "{{ ssh_port | string }}"
           - -i
