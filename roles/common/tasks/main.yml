@@ -1,0 +1,77 @@
+---
+- name: Require a Debian-family system
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == 'Debian'
+    fail_msg: "This common role currently supports Debian/Ubuntu only."
+
+- name: Validate selected administrator username
+  ansible.builtin.assert:
+    that:
+      - admin_user is match('^[a-z_][a-z0-9_-]*$')
+      - admin_user != 'root'
+    fail_msg: "Use a non-root Linux username (lowercase, digits, underscore or hyphen)."
+
+- name: Check controller SSH public key exists
+  ansible.builtin.stat:
+    path: "{{ admin_ssh_public_key_file }}"
+  delegate_to: localhost
+  become: false
+  register: common_public_key
+
+- name: Check controller SSH private key exists
+  ansible.builtin.stat:
+    path: "{{ admin_ssh_private_key_file }}"
+  delegate_to: localhost
+  become: false
+  register: common_private_key
+
+- name: Require both controller key files
+  ansible.builtin.assert:
+    that:
+      - common_public_key.stat.isreg | default(false)
+      - common_private_key.stat.isreg | default(false)
+    fail_msg: "Generate or point admin_ssh_public_key_file and admin_ssh_private_key_file to matching keys on the Ansible controller."
+
+- name: Update APT cache and install baseline packages
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+    name: "{{ common_packages }}"
+    state: present
+
+- name: Install fastfetch where available in default distro repositories
+  ansible.builtin.apt:
+    name: fastfetch
+    state: present
+  when:
+    - common_install_fastfetch | bool
+    - (ansible_facts['distribution'] == 'Debian' and ansible_facts['distribution_major_version'] | int >= 13) or (ansible_facts['distribution'] == 'Ubuntu' and ansible_facts['distribution_major_version'] | int >= 25)
+
+- name: Ensure administrator exists and belongs to sudo group
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    shell: "{{ admin_shell }}"
+    groups: sudo
+    append: true
+    create_home: true
+    state: present
+
+- name: Install administrator SSH public key
+  ansible.posix.authorized_key:
+    user: "{{ admin_user }}"
+    key: "{{ lookup('file', admin_ssh_public_key_file) }}"
+    state: present
+    exclusive: false
+
+- name: Set passwordless sudo for the Ansible administrator
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/90-ansible-{{ admin_user }}"
+    content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: '0440'
+    validate: '/usr/sbin/visudo -cf %s'
+
+- name: Verify administrator login BEFORE any SSH hardening
+  ansible.builtin.include_tasks: verify_admin_ssh.yml

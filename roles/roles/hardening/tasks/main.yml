@@ -1,0 +1,159 @@
+---
+# Security packages, firewall, SSH lockdown, and post-change SSH verification.
+- name: Verify administrator key login and sudo before applying hardening
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: verify_admin_ssh
+- name: Install security packages
+  ansible.builtin.apt:
+    name:
+      - ufw
+      - fail2ban
+      - unattended-upgrades
+      - needrestart
+      - python3-systemd
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+- name: Allow SSH through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ ssh_port }}"
+    proto: tcp
+    comment: SSH
+  when: hardening_manage_firewall | bool
+- name: Allow additional selected application TCP ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item | string }}"
+    proto: tcp
+  loop: "{{ hardening_allowed_tcp_ports }}"
+  when: hardening_manage_firewall | bool
+- name: Set UFW default incoming policy
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+  when: hardening_manage_firewall | bool
+- name: Set UFW default outgoing policy
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+  when: hardening_manage_firewall | bool
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+    logging: low
+  when: hardening_manage_firewall | bool
+- name: Configure Fail2ban SSH protection
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/sshd.local
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [sshd]
+      enabled = true
+      backend = {{ hardening_fail2ban_backend }}
+      port = {{ ssh_port }}
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
+  notify: Restart Fail2ban
+- name: Enable and start Fail2ban
+  ansible.builtin.systemd_service:
+    name: fail2ban
+    enabled: true
+    state: started
+- name: Enable automatic package list updates and unattended upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+- name: Install final SSH hardening configuration
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible
+
+      Port {{ ssh_port }}
+
+      PermitRootLogin no
+
+      PubkeyAuthentication yes
+      AuthorizedKeysFile .ssh/authorized_keys
+      AuthenticationMethods publickey
+
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitEmptyPasswords no
+
+      X11Forwarding no
+
+      MaxAuthTries 3
+      LoginGraceTime 30
+  register: ssh_hardening
+- name: Validate final SSH configuration
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -t
+  changed_when: false
+- name: Read effective SSH configuration before activating it
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -T
+  register: hardened_sshd_effective
+  changed_when: false
+- name: Require effective SSH restrictions to match policy
+  ansible.builtin.assert:
+    that:
+      - "'permitrootlogin no' in hardened_sshd_effective.stdout_lines"
+      - "'passwordauthentication no' in hardened_sshd_effective.stdout_lines"
+      - "'kbdinteractiveauthentication no' in hardened_sshd_effective.stdout_lines"
+      - "'pubkeyauthentication yes' in hardened_sshd_effective.stdout_lines"
+      - "'authenticationmethods publickey' in hardened_sshd_effective.stdout_lines"
+    fail_msg: sshd -T does not reflect the intended policy; SSH has not been reloaded.
+- name: Check whether ssh.socket exists
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - cat
+      - ssh.socket
+  register: ssh_socket_unit
+  changed_when: false
+  failed_when: false
+- name: Disable SSH socket activation
+  ansible.builtin.systemd_service:
+    name: ssh.socket
+    state: stopped
+    enabled: false
+  when: ssh_socket_unit.rc == 0
+- name: Ensure SSH runtime directory exists
+  ansible.builtin.file:
+    path: /run/sshd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+- name: Ensure SSH service is enabled and running
+  ansible.builtin.systemd_service:
+    name: ssh
+    state: started
+    enabled: true
+- name: Reload SSH with hardened configuration
+  ansible.builtin.systemd_service:
+    name: ssh
+    state: reloaded
+  when: ssh_hardening.changed
+- name: Verify hardened SSH login and sudo through a fresh connection
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: verify_admin_ssh

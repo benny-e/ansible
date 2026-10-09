@@ -1,0 +1,135 @@
+---
+- name: Require Debian-family system for hardening
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == 'Debian'
+
+# Reuse the fresh connection test from the common role. Never restrict SSH
+# before confirming that the administrator can log in and use sudo.
+- name: Verify key and sudo before tightening remote access
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: verify_admin_ssh
+
+- name: Install security packages
+  ansible.builtin.apt:
+    name:
+      - ufw
+      - fail2ban
+      - python3-systemd
+      - unattended-upgrades
+      - needrestart
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Allow the CURRENT SSH port before enabling UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ admin_ssh_port | string }}"
+    proto: tcp
+  when: hardening_manage_firewall | bool
+
+- name: Preserve explicitly requested application TCP ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item | string }}"
+    proto: tcp
+  loop: "{{ hardening_allowed_tcp_ports }}"
+  when: hardening_manage_firewall | bool
+
+- name: Deny incoming traffic by default
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+  when: hardening_manage_firewall | bool
+
+- name: Allow outgoing traffic by default
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+  when: hardening_manage_firewall | bool
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+  when: hardening_manage_firewall | bool
+
+- name: Configure Fail2ban SSH jail using the systemd journal
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/sshd-ansible.local
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [sshd]
+      enabled = true
+      backend = systemd
+      port = {{ admin_ssh_port }}
+      maxretry = {{ hardening_fail2ban_maxretry }}
+      findtime = {{ hardening_fail2ban_findtime }}
+      bantime = {{ hardening_fail2ban_bantime }}
+  register: hardening_fail2ban_jail
+
+- name: Ensure Fail2ban is enabled and uses the current jail configuration
+  ansible.builtin.service:
+    name: fail2ban
+    enabled: true
+    state: "{{ 'restarted' if hardening_fail2ban_jail.changed else 'started' }}"
+
+- name: Enable periodic APT package lists and unattended upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+- name: Ensure SSH configuration drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Harden SSH using an early drop-in
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+  notify: Reload SSH safely
+
+- name: Validate new sshd configuration syntax before reloading
+  ansible.builtin.command: /usr/sbin/sshd -t
+  changed_when: false
+
+- name: Inspect effective SSH configuration before reloading
+  ansible.builtin.command: /usr/sbin/sshd -T
+  changed_when: false
+  register: hardening_effective_sshd
+
+- name: Confirm root and password authentication really are disabled
+  ansible.builtin.assert:
+    that:
+      - "'permitrootlogin no' in hardening_effective_sshd.stdout_lines"
+      - "'passwordauthentication no' in hardening_effective_sshd.stdout_lines"
+      - "'kbdinteractiveauthentication no' in hardening_effective_sshd.stdout_lines"
+      - "'pubkeyauthentication yes' in hardening_effective_sshd.stdout_lines"
+    fail_msg: "The effective sshd config differs. Check Include order and existing SSH drop-ins. SSH has NOT been reloaded."
+
+- name: Apply validated SSH configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify fresh administrator SSH connection AFTER SSH hardening
+  ansible.builtin.include_role:
+    name: common
+    tasks_from: verify_admin_ssh

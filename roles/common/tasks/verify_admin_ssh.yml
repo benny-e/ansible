@@ -1,0 +1,32 @@
+---
+# Run SSH directly FROM the Ansible controller so this is a new key-based
+# connection for admin_user, not the existing Ansible session's identity.
+- name: Open a fresh administrator SSH connection using the private key
+  ansible.builtin.command:
+    argv: "{{ admin_ssh_command + [admin_user ~ '@' ~ admin_ssh_address, 'id -un'] }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: verified_admin_login
+
+- name: Require the returned username to match
+  ansible.builtin.assert:
+    that:
+      - verified_admin_login.rc == 0
+      - verified_admin_login.stdout == admin_user
+    fail_msg: 'The new administrator SSH connection did not authenticate as the expected account.'
+
+- name: Verify sudo from a fresh administrator SSH connection
+  ansible.builtin.command:
+    argv: "{{ admin_ssh_command + [admin_user ~ '@' ~ admin_ssh_address, 'sudo -n id -u'] }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: verified_admin_sudo
+
+- name: Require administrator sudo elevation to succeed
+  ansible.builtin.assert:
+    that:
+      - verified_admin_sudo.rc == 0
+      - verified_admin_sudo.stdout == '0'
+    fail_msg: 'The administrator key works, but sudo is not configured as expected.'

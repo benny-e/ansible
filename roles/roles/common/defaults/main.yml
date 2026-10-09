@@ -1,0 +1,50 @@
+---
+# Shared defaults, overridable via inventory/group_vars/-e or a playbook.
+admin_user: admin
+admin_shell: /bin/bash
+admin_public_key_file: "{{ lookup('env', 'HOME') + '/.ssh/id_ed25519.pub' }}"
+admin_private_key_file: "{{ lookup('env', 'HOME') + '/.ssh/id_ed25519' }}"
+ssh_port: 22
+admin_ssh_address: "{{ ansible_host | default(inventory_hostname) }}"
+
+# Disable SSH connection multiplexing so checks cannot reuse an existing session.
+admin_ssh_command:
+  - ssh
+  - -o
+  - BatchMode=yes
+  - -o
+  - IdentitiesOnly=yes
+  - -o
+  - PreferredAuthentications=publickey
+  - -o
+  - PasswordAuthentication=no
+  - -o
+  - KbdInteractiveAuthentication=no
+  - -o
+  - ConnectTimeout=10
+  - -o
+  - StrictHostKeyChecking=accept-new
+  - -o
+  - ControlMaster=no
+  - -o
+  - ControlPath=none
+  - -p
+  - "{{ ssh_port | string }}"
+  - -i
+  - "{{ admin_private_key_file }}"
+
+common_packages:
+  - sudo
+  - vim
+  - git
+  - curl
+  - wget
+  - htop
+  - tmux
+  - jq
+  - rsync
+  - unzip
+  - ca-certificates
+
+common_install_fastfetch: true
+common_upgrade_packages: true

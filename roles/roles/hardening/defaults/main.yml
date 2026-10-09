@@ -1,0 +1,4 @@
+---
+eaardening_allowed_tcp_ports: []
+hardening_manage_firewall: true
+hardening_fail2ban_backend: systemd

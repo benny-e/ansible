@@ -1,0 +1,26 @@
+---
+# Independent SSH connections from the Ansible controller, never localhost-to-localhost.
+- name: Verify fresh admin SSH key login from controller
+  ansible.builtin.command:
+    argv: '{{ admin_ssh_command + [admin_user ~ ''@'' ~ admin_ssh_address, ''id -un''] }}'
+  delegate_to: localhost
+  become: false
+  register: verified_admin_login
+  changed_when: false
+- name: Require SSH login to return the expected username
+  ansible.builtin.assert:
+    that:
+      - verified_admin_login.stdout == admin_user
+    fail_msg: Fresh key-only SSH login did not return the chosen administrator username.
+- name: Verify admin can use passwordless sudo from fresh SSH connection
+  ansible.builtin.command:
+    argv: '{{ admin_ssh_command + [admin_user ~ ''@'' ~ admin_ssh_address, ''sudo -n id -u''] }}'
+  delegate_to: localhost
+  become: false
+  register: verified_admin_sudo
+  changed_when: false
+- name: Require administrator to successfully elevate to root
+  ansible.builtin.assert:
+    that:
+      - verified_admin_sudo.stdout == '0'
+    fail_msg: SSH key login worked, but sudo -n did not become root.

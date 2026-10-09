@@ -1,0 +1,8 @@
+---
+# Additional inbound TCP ports to preserve on an existing application host.
+# Example: [80, 443, 8096]. SSH is automatically allowed separately.
+hardening_allowed_tcp_ports: []
+hardening_manage_firewall: true
+hardening_fail2ban_maxretry: 5
+hardening_fail2ban_bantime: 1h
+hardening_fail2ban_findtime: 10m

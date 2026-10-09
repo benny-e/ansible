@@ -1,0 +1,13 @@
+---
+- name: Configure and harden Debian or Ubuntu servers
+  hosts: all
+  become: true
+  gather_facts: true
+  vars_prompt:
+    - name: admin_user
+      prompt: Admin username
+      default: admin
+      private: false
+  roles:
+    - common
+    - hardening

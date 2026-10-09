@@ -1,0 +1,176 @@
+---
+# Creates the administrator and proves new key-based SSH login works before hardening.
+- name: Refuse to run on non-Debian systems
+  ansible.builtin.assert:
+    that:
+      - ansible_facts["os_family"] == "Debian"
+    fail_msg: This playbook currently supports Debian/Ubuntu systems only.
+- name: Refuse unsafe administrator usernames
+  ansible.builtin.assert:
+    that:
+      - admin_user is match('^[a-z_][a-z0-9_-]*$')
+      - admin_user != 'root'
+    fail_msg: Admin username must be a non-root Linux account without special characters.
+- name: Verify controller public key exists
+  ansible.builtin.stat:
+    path: '{{ admin_public_key_file }}'
+  delegate_to: localhost
+  become: false
+  register: controller_public_key
+- name: Verify controller private key exists
+  ansible.builtin.stat:
+    path: '{{ admin_private_key_file }}'
+  delegate_to: localhost
+  become: false
+  register: controller_private_key
+- name: Refuse to continue without SSH keypair
+  ansible.builtin.assert:
+    that:
+      - controller_public_key.stat.exists
+      - controller_private_key.stat.exists
+    fail_msg: Expected SSH keypair at {{ admin_private_key_file }} and {{ admin_public_key_file }}.
+- name: Update APT package cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+- name: Upgrade installed packages
+  ansible.builtin.apt:
+    upgrade: safe
+  when: common_upgrade_packages | bool
+- name: Install baseline packages
+  ansible.builtin.apt:
+    name: '{{ common_packages }}'
+    state: present
+- name: Install fastfetch on Debian 13+ and Ubuntu 25+
+  ansible.builtin.apt:
+    name: fastfetch
+    state: present
+  when:
+    - common_install_fastfetch | bool
+    - |-
+      (ansible_facts['distribution'] == 'Debian' and
+       ansible_facts['distribution_major_version'] | int >= 13)
+      or (ansible_facts['distribution'] == 'Ubuntu' and
+          ansible_facts['distribution_major_version'] | int >= 25)
+- name: Create admin user
+  ansible.builtin.user:
+    name: '{{ admin_user }}'
+    shell: '{{ admin_shell }}'
+    create_home: true
+    groups:
+      - sudo
+    append: true
+    state: present
+- name: Check admin account password state
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/passwd
+      - -S
+      - '{{ admin_user }}'
+  register: admin_password_state
+  changed_when: false
+- name: Make locked admin account usable for key authentication
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/usermod
+      - -p
+      - NP
+      - '{{ admin_user }}'
+  when:
+    - admin_password_state.stdout.split() | length >= 2
+    - admin_password_state.stdout.split()[1] == "L"
+- name: Recheck admin account password state
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/passwd
+      - -S
+      - '{{ admin_user }}'
+  register: admin_password_state_after
+  changed_when: false
+- name: Refuse to continue if admin account is still locked
+  ansible.builtin.assert:
+    that:
+      - admin_password_state_after.stdout.split() | length >= 2
+      - admin_password_state_after.stdout.split()[1] != "L"
+    fail_msg: The {{ admin_user }} account is still locked. Refusing to change SSH configuration.
+- name: Create admin SSH directory
+  ansible.builtin.file:
+    path: /home/{{ admin_user }}/.ssh
+    state: directory
+    owner: '{{ admin_user }}'
+    group: '{{ admin_user }}'
+    mode: '0700'
+- name: Install admin SSH public key
+  ansible.builtin.lineinfile:
+    path: /home/{{ admin_user }}/.ssh/authorized_keys
+    line: '{{ lookup(''file'', admin_public_key_file) }}'
+    create: true
+    owner: '{{ admin_user }}'
+    group: '{{ admin_user }}'
+    mode: '0600'
+    state: present
+- name: Ensure admin home ownership is correct
+  ansible.builtin.file:
+    path: /home/{{ admin_user }}
+    owner: '{{ admin_user }}'
+    group: '{{ admin_user }}'
+- name: Configure passwordless sudo for admin
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/{{ admin_user }}
+    content: |
+      {{ admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL
+    owner: root
+    group: root
+    mode: '0440'
+    validate: /usr/sbin/visudo -cf %s
+- name: Ensure SSH configuration directory exists
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+- name: Check for existing managed SSH configuration
+  ansible.builtin.stat:
+    path: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
+  register: existing_managed_ssh_config
+- name: Install temporary SSH bootstrap configuration
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      # Managed by Ansible
+      # Bootstrap configuration - hardening occurs after key verification.
+
+      PubkeyAuthentication yes
+      AuthorizedKeysFile .ssh/authorized_keys
+      AuthenticationMethods any
+      PermitEmptyPasswords no
+  register: ssh_bootstrap_config
+  when: not existing_managed_ssh_config.stat.exists
+- name: Validate bootstrap SSH configuration
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -t
+  changed_when: false
+- name: Check whether SSH service is active
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - ssh.service
+  register: ssh_service_active
+  changed_when: false
+  failed_when: false
+- name: Reload SSH bootstrap configuration
+  ansible.builtin.systemd_service:
+    name: ssh
+    state: reloaded
+  when:
+    - ssh_bootstrap_config.changed
+    - ssh_service_active.rc == 0
+- name: Verify admin SSH key and sudo BEFORE hardening
+  ansible.builtin.include_tasks: verify_admin_ssh.yml
