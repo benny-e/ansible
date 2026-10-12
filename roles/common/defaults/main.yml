@@ -39,5 +39,6 @@ common_packages:
   - rsync
   - unzip
   - ca-certificates
+  - procps
 
 common_install_fastfetch: true

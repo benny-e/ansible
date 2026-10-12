@@ -1,0 +1,27 @@
+---
+- name: Bootstrap fresh Debian or Ubuntu server
+  hosts: all
+  gather_facts: false
+  become: true
+  become_method: su
+  become_user: root
+
+  vars_prompt:
+    - name: bootstrap_user
+      prompt: "Existing SSH username"
+      private: false
+
+  tasks:
+    - name: Install sudo if missing
+      ansible.builtin.raw: |
+        if ! command -v sudo >/dev/null 2>&1; then
+          apt-get update &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y sudo
+        fi
+
+    - name: Grant existing user sudo permissions
+      ansible.builtin.raw: |
+        usermod -aG sudo {{ bootstrap_user | quote }}
+
+    - name: Reset SSH connection
+      ansible.builtin.meta: reset_connection
